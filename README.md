@@ -1,18 +1,20 @@
 # Tailscale Seat Manager
 
-Automate Tailscale user lifecycle management: periodically suspend idle users and let suspended users restore their own access via a Slack bot — with identity verified through Okta.
+Automate Tailscale user lifecycle management: periodically suspend idle users and let suspended users restore their own access — with identity verified through Okta.
+
+Two self-service restore options are included. Choose whichever fits your stack:
 
 ```
-┌─────────────────────────┐          ┌──────────────────────────┐
-│   idle-suspender (cron) │          │   slack-restore-bot      │
-│                         │          │                          │
-│  1. List tailnet users  │          │  1. User DMs the bot     │
-│  2. Find idle >30 days  │          │  2. Bot reads Okta email │
-│  3. Suspend via API     │──────────│     from Slack profile   │
-│  4. Notify Slack channel│          │  3. Matches suspended    │
-└─────────────────────────┘          │     Tailscale account    │
-                                     │  4. Restores on confirm  │
-                                     └──────────────────────────┘
+┌─────────────────────────┐    ┌──────────────────────────┐    ┌──────────────────────────┐
+│   idle-suspender (cron) │    │   slack-restore-bot       │    │   okta-restore-web       │
+│                         │    │                          │    │                          │
+│  1. List tailnet users  │    │  1. User DMs the bot     │    │  1. User visits page     │
+│  2. Find idle >30 days  │    │  2. Bot reads Okta email │    │  2. Signs in via Okta    │
+│  3. Suspend via API     │    │     from Slack profile   │    │     (MFA enforced)       │
+│  4. Notify Slack channel│    │  3. Matches suspended    │    │  3. Okta returns email   │
+└─────────────────────────┘    │     Tailscale account    │    │  4. Account restored     │
+                               │  4. Restores on confirm  │    └──────────────────────────┘
+                               └──────────────────────────┘
 ```
 
 ---
@@ -39,6 +41,19 @@ A Slack bot using [Socket Mode](https://api.slack.com/apis/socket-mode) (no publ
 - Verifies the requester's identity again before calling the restore API
 - Users can only ever restore their own account
 
+### okta-restore-web
+
+A small web server that verifies identity via a full **Okta OIDC login** before restoring access. It:
+
+- Presents a simple "Sign in with Okta" landing page — no Slack required
+- Redirects the user through your Okta tenant, enforcing whatever MFA policy you have configured
+- Receives the user's verified email directly from Okta's userinfo endpoint — the user never types their own email
+- Matches the email against suspended Tailscale accounts and restores on confirmation
+- Uses HMAC-signed state tokens to prevent CSRF attacks during the OAuth flow
+- Adds security headers (`X-Frame-Options`, `CSP`, etc.) on every response
+
+This option provides the **strongest identity guarantee** of the two, since it uses the same Okta authentication challenge that Tailscale itself relies on, including MFA.
+
 ---
 
 ## Prerequisites
@@ -47,8 +62,9 @@ A Slack bot using [Socket Mode](https://api.slack.com/apis/socket-mode) (no publ
 |---|---|
 | Go 1.23+ | For building the binaries |
 | Tailscale account | With API key scoped to your tailnet |
-| Okta → Slack SCIM provisioning | Ensures `user.profile.email` in Slack matches the Tailscale `loginName` |
-| Slack app with Socket Mode | See setup below |
+| Okta tenant | Used for both Slack SCIM sync (bot) and OIDC login (web) |
+| Slack app with Socket Mode | Only required for `slack-restore-bot` |
+| Web server / hosting | Only required for `okta-restore-web` (Cloudflare Workers, a VPS, k8s, etc.) |
 
 ---
 
@@ -129,9 +145,10 @@ The restore bot matches a user's **Slack profile email** against their **Tailsca
 git clone https://github.com/cryan1988/tailscale-seat-manager.git
 cd tailscale-seat-manager
 
-# Build both binaries into ./bin/
+# Build all three binaries into ./bin/
 go build -o bin/idle-suspender      ./cmd/idle-suspender/
 go build -o bin/slack-restore-bot   ./cmd/slack-restore-bot/
+go build -o bin/okta-restore-web    ./cmd/okta-restore-web/
 ```
 
 ---
@@ -279,6 +296,103 @@ The user then reconnects in the Tailscale client without any IT admin involvemen
 
 ---
 
+## 7. Running the Okta restore web app
+
+This is an alternative to the Slack bot. Use it when you want a self-contained web-based restore flow that doesn't depend on Slack.
+
+### 7a. Create an Okta OIDC application
+
+1. In Okta Admin, go to **Applications → Applications → Create App Integration**.
+2. Choose **OIDC - OpenID Connect** → **Web Application**.
+3. Name it (e.g. `Tailscale Restore`).
+4. Under **Grant type**, ensure **Authorization Code** is checked.
+5. Set **Sign-in redirect URIs** to your callback URL:
+   ```
+   https://restore.yourcompany.com/auth/callback
+   ```
+   Use `http://localhost:8080/auth/callback` for local testing.
+6. Under **Assignments**, assign the application to **Everyone** (or a specific group if you want to restrict who can self-restore).
+7. Save and note the **Client ID** and **Client Secret**.
+8. Note your **Okta domain** from the top-right of the Okta Admin console (e.g. `yourcompany.okta.com`).
+
+### 7b. Enable MFA on the Okta application (recommended)
+
+1. In Okta Admin, go to **Security → Authentication Policies**.
+2. Create or edit a policy and add a rule that requires MFA for the Tailscale Restore app.
+3. Assign that policy to the `Tailscale Restore` application under **Applications → [app] → Sign On**.
+
+This ensures that even if a user's password is compromised, they cannot restore their own Tailscale access without passing MFA.
+
+### 7c. Environment variables
+
+| Variable | Required | Description |
+|---|---|---|
+| `TAILSCALE_API_KEY` | Yes | Tailscale API key |
+| `TAILSCALE_TAILNET` | No | Tailnet domain or `-` (default: `-`) |
+| `OKTA_DOMAIN` | Yes | Your Okta domain, e.g. `yourcompany.okta.com` |
+| `OKTA_CLIENT_ID` | Yes | Client ID from the OIDC app |
+| `OKTA_CLIENT_SECRET` | Yes | Client secret from the OIDC app |
+| `OKTA_REDIRECT_URI` | Yes | Full callback URL, e.g. `https://restore.yourcompany.com/auth/callback` |
+| `SESSION_SECRET` | Yes | Random string ≥ 32 characters for signing CSRF state tokens |
+| `PORT` | No | HTTP listen port (default: `8080`) |
+
+Generate a secure `SESSION_SECRET`:
+
+```bash
+openssl rand -base64 32
+```
+
+### 7d. Run locally for testing
+
+```bash
+export TAILSCALE_API_KEY=tskey-api-...
+export TAILSCALE_TAILNET=yourcompany.com
+export OKTA_DOMAIN=yourcompany.okta.com
+export OKTA_CLIENT_ID=0oaxxxxxxxxxxxxxxxxx
+export OKTA_CLIENT_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+export OKTA_REDIRECT_URI=http://localhost:8080/auth/callback
+export SESSION_SECRET=$(openssl rand -base64 32)
+
+./bin/okta-restore-web
+# Open http://localhost:8080 in a browser
+```
+
+### 7e. Deploy to production
+
+For production, run behind a TLS-terminating reverse proxy (nginx, Caddy, AWS ALB, etc.) or deploy as a container. The binary itself listens on plain HTTP and sets the `Secure` cookie flag only when the incoming request arrived over HTTPS (detected via `r.TLS`). If your proxy terminates TLS before the binary, set `OKTA_REDIRECT_URI` to your `https://` URL.
+
+Example with Caddy (automatic TLS):
+
+```
+restore.yourcompany.com {
+    reverse_proxy localhost:8080
+}
+```
+
+Or as a Docker container:
+
+```dockerfile
+FROM golang:1.23-alpine AS build
+WORKDIR /src
+COPY . .
+RUN go build -o /okta-restore-web ./cmd/okta-restore-web/
+
+FROM alpine:3.20
+COPY --from=build /okta-restore-web /okta-restore-web
+ENTRYPOINT ["/okta-restore-web"]
+```
+
+### 7f. End-user experience
+
+1. User visits `https://restore.yourcompany.com`
+2. Clicks **Sign in with Okta** — redirected to their company Okta login
+3. Completes Okta authentication (password + MFA if configured)
+4. Redirected back automatically — no form to fill in
+5. If their account is suspended, they see a confirmation and their access is restored
+6. They open the Tailscale app and reconnect
+
+---
+
 ## Roles protected from auto-suspension
 
 The idle-suspender never suspends users with elevated roles, regardless of inactivity:
@@ -301,11 +415,13 @@ tailscale-seat-manager/
 ├── cmd/
 │   ├── idle-suspender/
 │   │   └── main.go          # Periodic suspension job
-│   └── slack-restore-bot/
-│       └── main.go          # Slack self-service bot
+│   ├── slack-restore-bot/
+│   │   └── main.go          # Slack self-service restore bot
+│   └── okta-restore-web/
+│       └── main.go          # Okta OIDC web self-service restore
 ├── internal/
 │   └── tsapi/
-│       └── client.go        # Tailscale API client
+│       └── client.go        # Tailscale API client (shared)
 ├── go.mod
 ├── go.sum
 └── README.md
